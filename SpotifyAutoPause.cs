@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace SpotifyAutoPause
@@ -14,24 +16,26 @@ namespace SpotifyAutoPause
     {
         private const int WM_APPCOMMAND = 0x0319;
         private static readonly IntPtr APPCOMMAND_MEDIA_PLAY_PAUSE = (IntPtr)(14 << 16);
+        private static readonly IntPtr HWND_BROADCAST = (IntPtr)0xffff;
+        private static readonly uint WM_SHOW_SETTINGS = RegisterWindowMessage("WM_SPOTIFY_AUTOPAUSE_SHOW_SETTINGS");
 
+        private static Mutex appMutex;
         private static bool pausedByScript = false;
         private static bool monitoringEnabled = true;
         private static DateTime lastActionTime = DateTime.MinValue;
+        private static DateTime silenceStartTime = DateTime.MinValue;
         private static string currentColorState = "";
 
         private static NotifyIcon trayIcon;
         private static ToolStripMenuItem toggleMenuItem;
-        private static Timer monitorTimer;
+        private static System.Windows.Forms.Timer monitorTimer;
         private static SettingsForm settingsForm;
 
-        // 포터블 구조: 실행 파일 바로 옆에 ignore_list.txt 저장
         private static readonly string ConfigFilePath = Path.Combine(
             AppDomain.CurrentDomain.BaseDirectory,
             "ignore_list.txt"
         );
 
-        // 시작프로그램 폴더 내 바로가기 경로 (레지스트리 미사용)
         private static readonly string StartupShortcutPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.Startup),
             "SpotifyAutoPause.lnk"
@@ -51,18 +55,35 @@ namespace SpotifyAutoPause
             "kakaotalk"
         };
 
-        public static HashSet<string> UserIgnoreProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // 3가지 프로세스 관리 목록
+        public static HashSet<string> UserIgnoreProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);       // 소리 무시 (예외)
+        public static HashSet<string> ForceFocusProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);       // 맨 앞(포커스)일 때 소리 무관 강제 정지
+        public static HashSet<string> ForceBackgroundProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);  // 백그라운드 포함 실행 중일 때 소리 무관 강제 정지
+
         public static bool IgnoreSystemSounds = true;
+        public static double ResumeDelaySeconds = 3.0;
+        public static double VolumeThresholdPercent = 0.1;
 
         [STAThread]
         static void Main()
         {
+            bool createdNew;
+            appMutex = new Mutex(true, "Local\\SpotifyAutoPause_SingleInstance_Mutex", out createdNew);
+
+            if (!createdNew)
+            {
+                PostMessage(HWND_BROADCAST, WM_SHOW_SETTINGS, IntPtr.Zero, IntPtr.Zero);
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             LoadConfig();
 
-            var settingsMenuItem = new ToolStripMenuItem("예외 프로그램 설정...", null, OnOpenSettings);
+            var msgWindow = new MessageReceiverWindow();
+
+            var settingsMenuItem = new ToolStripMenuItem("프로그램 설정...", null, OnOpenSettings);
             settingsMenuItem.Font = new Font(settingsMenuItem.Font, FontStyle.Bold);
 
             toggleMenuItem = new ToolStripMenuItem("감시 활성화", null, OnToggleMonitoring)
@@ -87,7 +108,7 @@ namespace SpotifyAutoPause
             trayIcon.DoubleClick += OnOpenSettings;
             currentColorState = "green";
 
-            monitorTimer = new Timer
+            monitorTimer = new System.Windows.Forms.Timer
             {
                 Interval = 400
             };
@@ -95,6 +116,30 @@ namespace SpotifyAutoPause
             monitorTimer.Start();
 
             Application.Run();
+
+            GC.KeepAlive(msgWindow);
+            GC.KeepAlive(appMutex);
+        }
+
+        private class MessageReceiverWindow : NativeWindow
+        {
+            public MessageReceiverWindow()
+            {
+                CreateHandle(new CreateParams());
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == WM_SHOW_SETTINGS)
+                {
+                    if (settingsForm == null || settingsForm.IsDisposed)
+                    {
+                        OnOpenSettings(null, EventArgs.Empty);
+                    }
+                    return;
+                }
+                base.WndProc(ref m);
+            }
         }
 
         public static bool IsStartupEnabled()
@@ -141,10 +186,22 @@ namespace SpotifyAutoPause
             return UserIgnoreProcesses.Contains(procName);
         }
 
+        private static string NormalizeProcName(string raw)
+        {
+            string trimmed = raw.Trim().ToLowerInvariant();
+            if (trimmed.EndsWith(".exe"))
+                trimmed = trimmed.Substring(0, trimmed.Length - 4);
+            return trimmed;
+        }
+
         public static void LoadConfig()
         {
             UserIgnoreProcesses.Clear();
+            ForceFocusProcesses.Clear();
+            ForceBackgroundProcesses.Clear();
             IgnoreSystemSounds = true;
+            ResumeDelaySeconds = 3.0;
+            VolumeThresholdPercent = 0.1;
 
             if (File.Exists(ConfigFilePath))
             {
@@ -159,12 +216,49 @@ namespace SpotifyAutoPause
                         continue;
                     }
 
-                    if (trimmed.EndsWith(".exe"))
-                        trimmed = trimmed.Substring(0, trimmed.Length - 4);
-
-                    if (!SystemProcesses.Contains(trimmed) && trimmed != "spotify")
+                    if (trimmed.StartsWith("resume_delay="))
                     {
-                        UserIgnoreProcesses.Add(trimmed);
+                        double parsed;
+                        if (double.TryParse(trimmed.Substring("resume_delay=".Length), NumberStyles.Float, CultureInfo.InvariantCulture, out parsed))
+                        {
+                            if (parsed < 0.0) parsed = 0.0;
+                            ResumeDelaySeconds = parsed;
+                        }
+                        continue;
+                    }
+
+                    if (trimmed.StartsWith("volume_threshold="))
+                    {
+                        double parsed;
+                        if (double.TryParse(trimmed.Substring("volume_threshold=".Length), NumberStyles.Float, CultureInfo.InvariantCulture, out parsed))
+                        {
+                            if (parsed < 0.0) parsed = 0.0;
+                            if (parsed > 100.0) parsed = 100.0;
+                            VolumeThresholdPercent = parsed;
+                        }
+                        continue;
+                    }
+
+                    if (trimmed.StartsWith("focus:"))
+                    {
+                        string name = NormalizeProcName(trimmed.Substring("focus:".Length));
+                        if (!string.IsNullOrEmpty(name) && name != "spotify")
+                            ForceFocusProcesses.Add(name);
+                        continue;
+                    }
+
+                    if (trimmed.StartsWith("bg:"))
+                    {
+                        string name = NormalizeProcName(trimmed.Substring("bg:".Length));
+                        if (!string.IsNullOrEmpty(name) && name != "spotify")
+                            ForceBackgroundProcesses.Add(name);
+                        continue;
+                    }
+
+                    string ignoreName = NormalizeProcName(trimmed);
+                    if (!string.IsNullOrEmpty(ignoreName) && !SystemProcesses.Contains(ignoreName) && ignoreName != "spotify")
+                    {
+                        UserIgnoreProcesses.Add(ignoreName);
                     }
                 }
             }
@@ -182,9 +276,13 @@ namespace SpotifyAutoPause
             {
                 var lines = new List<string>
                 {
-                    "ignore_system=" + (IgnoreSystemSounds ? "true" : "false")
+                    "ignore_system=" + (IgnoreSystemSounds ? "true" : "false"),
+                    "resume_delay=" + ResumeDelaySeconds.ToString("0.0", CultureInfo.InvariantCulture),
+                    "volume_threshold=" + VolumeThresholdPercent.ToString("0.##", CultureInfo.InvariantCulture)
                 };
                 lines.AddRange(UserIgnoreProcesses.OrderBy(x => x));
+                lines.AddRange(ForceFocusProcesses.OrderBy(x => x).Select(x => "focus:" + x));
+                lines.AddRange(ForceBackgroundProcesses.OrderBy(x => x).Select(x => "bg:" + x));
                 File.WriteAllLines(ConfigFilePath, lines.ToArray());
             }
             catch { }
@@ -196,11 +294,6 @@ namespace SpotifyAutoPause
             {
                 settingsForm = new SettingsForm();
                 settingsForm.Show();
-            }
-            else
-            {
-                if (settingsForm.WindowState == FormWindowState.Minimized)
-                    settingsForm.WindowState = FormWindowState.Normal;
                 settingsForm.Activate();
             }
         }
@@ -213,14 +306,32 @@ namespace SpotifyAutoPause
                 return;
             }
 
-            string activeProc = GetActiveProcessName();
             bool spotifyPlaying = false;
-            bool activeSound = false;
-            bool anyOtherSound = false;
+            bool shouldPause = false;
 
             try
             {
-                CheckAudioSessions(activeProc, out spotifyPlaying, out activeSound, out anyOtherSound);
+                // 1. 오디오 세션 검사 (예외 목록 외 프로그램의 소리 출력 여부)
+                CheckAudioSessions(out spotifyPlaying, out shouldPause);
+
+                // 2. 맨 앞(포커스) 앱 강제 정지 목록 검사 (소리 무관)
+                if (!shouldPause && ForceFocusProcesses.Count > 0)
+                {
+                    string activeProc = GetActiveProcessName();
+                    if (!string.IsNullOrEmpty(activeProc) && ForceFocusProcesses.Contains(activeProc))
+                    {
+                        shouldPause = true;
+                    }
+                }
+
+                // 3. 백그라운드 포함 실행 중 앱 강제 정지 목록 검사 (소리 무관)
+                if (!shouldPause && ForceBackgroundProcesses.Count > 0)
+                {
+                    if (IsAnyTargetProcessRunning(ForceBackgroundProcesses))
+                    {
+                        shouldPause = true;
+                    }
+                }
             }
             catch { }
 
@@ -229,22 +340,41 @@ namespace SpotifyAutoPause
                 if (spotifyPlaying && pausedByScript)
                 {
                     pausedByScript = false;
+                    silenceStartTime = DateTime.MinValue;
                 }
 
-                if (spotifyPlaying && activeSound && !pausedByScript)
+                // 일시정지 조건 충족 시 즉시 정지
+                if (spotifyPlaying && shouldPause && !pausedByScript)
                 {
                     if (SendSpotifyPlayPause())
                     {
                         pausedByScript = true;
                         lastActionTime = DateTime.Now;
+                        silenceStartTime = DateTime.MinValue;
                     }
                 }
-                else if (!anyOtherSound && pausedByScript && !string.IsNullOrEmpty(activeProc))
+                // 스크립트가 멈춰둔 상태 -> 정지 조건이 모두 해제된 후 유예 시간 경과 시 재개
+                else if (pausedByScript)
                 {
-                    if (SendSpotifyPlayPause())
+                    if (shouldPause)
                     {
-                        pausedByScript = false;
-                        lastActionTime = DateTime.Now;
+                        silenceStartTime = DateTime.MinValue;
+                    }
+                    else
+                    {
+                        if (silenceStartTime == DateTime.MinValue)
+                        {
+                            silenceStartTime = DateTime.Now;
+                        }
+                        else if ((DateTime.Now - silenceStartTime).TotalSeconds >= ResumeDelaySeconds)
+                        {
+                            if (SendSpotifyPlayPause())
+                            {
+                                pausedByScript = false;
+                                lastActionTime = DateTime.Now;
+                                silenceStartTime = DateTime.MinValue;
+                            }
+                        }
                     }
                 }
             }
@@ -253,6 +383,44 @@ namespace SpotifyAutoPause
                 UpdateTrayIcon("orange", Color.Orange);
             else
                 UpdateTrayIcon("green", Color.FromArgb(29, 185, 84));
+        }
+
+        private static string GetActiveProcessName()
+        {
+            try
+            {
+                IntPtr hwnd = GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return "";
+                uint pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (pid == 0) return "";
+                using (var proc = Process.GetProcessById((int)pid))
+                {
+                    return proc.ProcessName.ToLowerInvariant();
+                }
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static bool IsAnyTargetProcessRunning(HashSet<string> targetSet)
+        {
+            foreach (var p in Process.GetProcesses())
+            {
+                try
+                {
+                    if (targetSet.Contains(p.ProcessName.ToLowerInvariant()))
+                        return true;
+                }
+                catch { }
+                finally
+                {
+                    p.Dispose();
+                }
+            }
+            return false;
         }
 
         private static void UpdateTrayIcon(string state, Color color)
@@ -289,6 +457,7 @@ namespace SpotifyAutoPause
             {
                 SendSpotifyPlayPause();
                 pausedByScript = false;
+                silenceStartTime = DateTime.MinValue;
             }
         }
 
@@ -297,26 +466,6 @@ namespace SpotifyAutoPause
             monitorTimer.Stop();
             trayIcon.Visible = false;
             Application.Exit();
-        }
-
-        private static string GetActiveProcessName()
-        {
-            try
-            {
-                IntPtr hwnd = GetForegroundWindow();
-                if (hwnd == IntPtr.Zero) return "";
-                uint pid;
-                GetWindowThreadProcessId(hwnd, out pid);
-                if (pid == 0) return "";
-                using (var proc = Process.GetProcessById((int)pid))
-                {
-                    return proc.ProcessName.ToLowerInvariant();
-                }
-            }
-            catch
-            {
-                return "";
-            }
         }
 
         private static bool SendSpotifyPlayPause()
@@ -351,11 +500,12 @@ namespace SpotifyAutoPause
             return sent;
         }
 
-        private static void CheckAudioSessions(string activeProc, out bool spotifyPlaying, out bool activeSound, out bool anyOtherSound)
+        private static void CheckAudioSessions(out bool spotifyPlaying, out bool anyOtherSound)
         {
             spotifyPlaying = false;
-            activeSound = false;
             anyOtherSound = false;
+
+            float threshold = (float)(VolumeThresholdPercent / 100.0);
 
             var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
             IMMDevice speakers;
@@ -386,32 +536,28 @@ namespace SpotifyAutoPause
                     {
                         float peak;
                         meter.GetPeakValue(out peak);
-                        if (peak > 0.001f)
-                        {
-                            string procName = "";
-                            try
-                            {
-                                using (var p = Process.GetProcessById((int)pid))
-                                {
-                                    procName = p.ProcessName.ToLowerInvariant();
-                                }
-                            }
-                            catch { }
 
-                            if (!string.IsNullOrEmpty(procName))
+                        string procName = "";
+                        try
+                        {
+                            using (var p = Process.GetProcessById((int)pid))
                             {
-                                if (procName == "spotify")
-                                {
+                                procName = p.ProcessName.ToLowerInvariant();
+                            }
+                        }
+                        catch { }
+
+                        if (!string.IsNullOrEmpty(procName))
+                        {
+                            if (procName == "spotify")
+                            {
+                                if (peak > 0.001f)
                                     spotifyPlaying = true;
-                                }
-                                else if (!IsProcessIgnored(procName))
-                                {
+                            }
+                            else if (!IsProcessIgnored(procName))
+                            {
+                                if (peak > threshold)
                                     anyOtherSound = true;
-                                    if (procName == activeProc)
-                                    {
-                                        activeSound = true;
-                                    }
-                                }
                             }
                         }
                     }
@@ -427,6 +573,12 @@ namespace SpotifyAutoPause
 
         #region Win32 & CoreAudio COM Interop
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
@@ -535,9 +687,15 @@ namespace SpotifyAutoPause
 
     public class SettingsForm : Form
     {
-        private ListView listViewIgnore;
+        private TabControl tabControl;
+        private ListView[] listViews = new ListView[3];
+        private Label lblTabDesc;
+
         private ImageList iconList;
+        private ToolTip toolTip;
         private ComboBox comboRunningProcs;
+        private NumericUpDown numResumeDelay;
+        private NumericUpDown numVolumeThreshold;
         private CheckBox chkIgnoreSystem;
         private CheckBox chkRunAtStartup;
         private Button btnRefresh;
@@ -546,10 +704,17 @@ namespace SpotifyAutoPause
 
         private readonly Dictionary<string, string> cachedExePaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly string[] TabDescriptions = new string[]
+        {
+            "소리가 나도 Spotify를 멈추지 않고 무시합니다.",
+            "해당 앱 창을 보고 있을 때(활성 창) 소리 무관 정지합니다.",
+            "백그라운드 포함 실행 중이면 소리 무관 정지합니다."
+        };
+
         public SettingsForm()
         {
-            Text = "Spotify AutoPause - 예외 프로그램 설정";
-            Size = new Size(450, 470);
+            Text = "Spotify AutoPause - 설정";
+            Size = new Size(460, 585);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -562,36 +727,70 @@ namespace SpotifyAutoPause
             };
             iconList.Images.Add("default", SystemIcons.Application.ToBitmap());
 
-            var lblDesc = new Label
+            toolTip = new ToolTip
             {
-                Text = "아래 목록에 등록된 앱은 소리가 나도 Spotify가 멈추지 않습니다.",
-                Location = new Point(15, 15),
-                Size = new Size(405, 22)
+                AutoPopDelay = 10000,
+                InitialDelay = 400,
+                ReshowDelay = 200,
+                ShowAlways = true
             };
 
-            listViewIgnore = new ListView
+            // 상단 3개 모드 탭 컨트롤
+            tabControl = new TabControl
             {
-                Location = new Point(15, 42),
-                Size = new Size(405, 205),
-                View = View.Details,
-                FullRowSelect = true,
-                HeaderStyle = ColumnHeaderStyle.None,
-                SmallImageList = iconList,
-                MultiSelect = false
+                Location = new Point(15, 12),
+                Size = new Size(415, 225)
             };
-            listViewIgnore.Columns.Add("프로그램", 380);
+
+            string[] tabTitles = new string[]
+            {
+                "예외 앱 (소리 무시)",
+                "강제 정지 (맨 앞 화면)",
+                "강제 정지 (실행 중)"
+            };
+
+            for (int i = 0; i < 3; i++)
+            {
+                var page = new TabPage(tabTitles[i]);
+                var lv = new ListView
+                {
+                    Dock = DockStyle.Fill,
+                    View = View.Details,
+                    FullRowSelect = true,
+                    HeaderStyle = ColumnHeaderStyle.None,
+                    SmallImageList = iconList,
+                    MultiSelect = false
+                };
+                lv.Columns.Add("프로그램", 385);
+                page.Controls.Add(lv);
+                tabControl.TabPages.Add(page);
+                listViews[i] = lv;
+            }
+
+            lblTabDesc = new Label
+            {
+                Text = TabDescriptions[0],
+                Location = new Point(16, 243),
+                Size = new Size(415, 22),
+                ForeColor = Color.DimGray
+            };
+
+            tabControl.SelectedIndexChanged += (s, e) =>
+            {
+                lblTabDesc.Text = TabDescriptions[tabControl.SelectedIndex];
+            };
 
             var lblInput = new Label
             {
-                Text = "실행 중인 앱 선택 또는 직접 입력 (예: chrome):",
-                Location = new Point(15, 258),
-                Size = new Size(405, 20)
+                Text = "현재 선택된 탭에 추가할 앱 선택 또는 직접 입력 (예: chrome):",
+                Location = new Point(15, 274),
+                Size = new Size(415, 20)
             };
 
             comboRunningProcs = new ComboBox
             {
-                Location = new Point(15, 282),
-                Size = new Size(245, 28),
+                Location = new Point(15, 298),
+                Size = new Size(255, 28),
                 DropDownStyle = ComboBoxStyle.DropDown,
                 DrawMode = DrawMode.OwnerDrawFixed,
                 ItemHeight = 22
@@ -601,19 +800,19 @@ namespace SpotifyAutoPause
             btnRefresh = new Button
             {
                 Text = "새로고침",
-                Location = new Point(266, 281),
+                Location = new Point(276, 297),
                 Size = new Size(75, 28)
             };
             btnRefresh.Click += (s, e) =>
             {
                 RefreshRunningProcesses();
-                RefreshIgnoreListView();
+                RefreshAllListViews();
             };
 
             btnAdd = new Button
             {
                 Text = "추가",
-                Location = new Point(346, 281),
+                Location = new Point(356, 297),
                 Size = new Size(74, 28)
             };
             btnAdd.Click += OnAddClick;
@@ -621,16 +820,81 @@ namespace SpotifyAutoPause
             btnRemove = new Button
             {
                 Text = "선택 항목 삭제",
-                Location = new Point(15, 320),
-                Size = new Size(405, 32)
+                Location = new Point(15, 336),
+                Size = new Size(415, 32)
             };
             btnRemove.Click += OnRemoveClick;
 
+            // 1. 무음 유예 시간 설정
+            var lblDelay = new Label
+            {
+                Text = "음악 재생 유예시간:",
+                Location = new Point(16, 384),
+                Size = new Size(320, 22)
+            };
+
+            numResumeDelay = new NumericUpDown
+            {
+                Location = new Point(340, 381),
+                Size = new Size(70, 26),
+                DecimalPlaces = 1,
+                Increment = 0.1M,
+                Minimum = 0.0M,
+                Maximum = decimal.MaxValue,
+                Value = (decimal)Program.ResumeDelaySeconds,
+                TextAlign = HorizontalAlignment.Right
+            };
+            numResumeDelay.ValueChanged += (s, e) =>
+            {
+                Program.ResumeDelaySeconds = (double)numResumeDelay.Value;
+                Program.SaveConfig();
+            };
+
+            var lblSec = new Label
+            {
+                Text = "초",
+                Location = new Point(413, 384),
+                Size = new Size(22, 22)
+            };
+
+            // 2. 볼륨 감지 임계값 설정
+            var lblThreshold = new Label
+            {
+                Text = "소리 감지 최소치:",
+                Location = new Point(16, 418),
+                Size = new Size(320, 22)
+            };
+
+            numVolumeThreshold = new NumericUpDown
+            {
+                Location = new Point(340, 415),
+                Size = new Size(70, 26),
+                DecimalPlaces = 2,
+                Increment = 0.05M,
+                Minimum = 0.00M,
+                Maximum = 100.00M,
+                Value = (decimal)Program.VolumeThresholdPercent,
+                TextAlign = HorizontalAlignment.Right
+            };
+            numVolumeThreshold.ValueChanged += (s, e) =>
+            {
+                Program.VolumeThresholdPercent = (double)numVolumeThreshold.Value;
+                Program.SaveConfig();
+            };
+
+            var lblPercent = new Label
+            {
+                Text = "%",
+                Location = new Point(413, 418),
+                Size = new Size(22, 22)
+            };
+
+            // 3. 체크박스 옵션
             chkIgnoreSystem = new CheckBox
             {
                 Text = "Windows 시스템 알림음 및 권한 팝업(UAC) 소리 무시 (권장)",
-                Location = new Point(16, 365),
-                Size = new Size(405, 24),
+                Location = new Point(16, 452),
+                Size = new Size(415, 24),
                 Checked = Program.IgnoreSystemSounds
             };
             chkIgnoreSystem.CheckedChanged += (s, e) =>
@@ -642,8 +906,8 @@ namespace SpotifyAutoPause
             chkRunAtStartup = new CheckBox
             {
                 Text = "Windows 시작 시 자동 실행",
-                Location = new Point(16, 393),
-                Size = new Size(405, 24),
+                Location = new Point(16, 480),
+                Size = new Size(415, 24),
                 Checked = Program.IsStartupEnabled()
             };
             chkRunAtStartup.CheckedChanged += (s, e) =>
@@ -652,18 +916,49 @@ namespace SpotifyAutoPause
                 chkRunAtStartup.Checked = Program.IsStartupEnabled();
             };
 
-            Controls.Add(lblDesc);
-            Controls.Add(listViewIgnore);
+            // 툴팁 설명 등록
+            toolTip.SetToolTip(tabControl,
+                "• 예외 앱 (소리 무시): 소리가 나도 Spotify를 멈추지 않을 앱 (예: Discord, 카카오톡)\n" +
+                "• 강제 정지 (맨 앞 화면): 해당 앱 창을 보고 있을 때만 소리 무관 Spotify 정지\n" +
+                "• 강제 정지 (실행 중): 백그라운드에 켜져만 있어도 소리 무관 Spotify 정지");
+
+            toolTip.SetToolTip(comboRunningProcs, "현재 창이 열려 있는 앱을 선택하거나, 작업 관리자 기준 프로세스 이름(.exe 제외)을 직접 입력하세요.");
+
+            string delayHelp = "외부 소리나 강제 정지 조건이 끝난 뒤 Spotify를 다시 재생하기까지 기다리는 시간입니다.\n BGM 등의 공백에서 음악 재생을 방지합니다.";
+            toolTip.SetToolTip(lblDelay, delayHelp);
+            toolTip.SetToolTip(numResumeDelay, delayHelp);
+
+            string thresholdHelp = "감지할 최소 소리 크기(%)입니다.\n• 소리가 작은 게임이 인식이 안 되면 값을 낮추세요 (예: 0.01%)\n• 미세한 효과음이나 노이즈 때문에 자꾸 멈추면 값을 높이세요 (예: 1.0%)";
+            toolTip.SetToolTip(lblThreshold, thresholdHelp);
+            toolTip.SetToolTip(numVolumeThreshold, thresholdHelp);
+
+            toolTip.SetToolTip(chkIgnoreSystem, "Windows 알림음, 볼륨 조절 효과음, 관리자 권한(UAC) 팝업 소리 때문에 음악이 끊기는 것을 막습니다.");
+
+            Controls.Add(tabControl);
+            Controls.Add(lblTabDesc);
             Controls.Add(lblInput);
             Controls.Add(comboRunningProcs);
             Controls.Add(btnRefresh);
             Controls.Add(btnAdd);
             Controls.Add(btnRemove);
+            Controls.Add(lblDelay);
+            Controls.Add(numResumeDelay);
+            Controls.Add(lblSec);
+            Controls.Add(lblThreshold);
+            Controls.Add(numVolumeThreshold);
+            Controls.Add(lblPercent);
             Controls.Add(chkIgnoreSystem);
             Controls.Add(chkRunAtStartup);
 
             RefreshRunningProcesses();
-            RefreshIgnoreListView();
+            RefreshAllListViews();
+        }
+
+        private HashSet<string> GetTargetSet(int tabIndex)
+        {
+            if (tabIndex == 1) return Program.ForceFocusProcesses;
+            if (tabIndex == 2) return Program.ForceBackgroundProcesses;
+            return Program.UserIgnoreProcesses;
         }
 
         private string EnsureProcessIcon(string procName)
@@ -714,19 +1009,24 @@ namespace SpotifyAutoPause
             return "default";
         }
 
-        private void RefreshIgnoreListView()
+        private void RefreshAllListViews()
         {
-            listViewIgnore.BeginUpdate();
-            listViewIgnore.Items.Clear();
-
-            foreach (var proc in Program.UserIgnoreProcesses.OrderBy(x => x))
+            for (int i = 0; i < 3; i++)
             {
-                string iconKey = EnsureProcessIcon(proc);
-                var item = new ListViewItem(proc, iconKey);
-                listViewIgnore.Items.Add(item);
-            }
+                var lv = listViews[i];
+                var set = GetTargetSet(i);
 
-            listViewIgnore.EndUpdate();
+                lv.BeginUpdate();
+                lv.Items.Clear();
+
+                foreach (var proc in set.OrderBy(x => x))
+                {
+                    string iconKey = EnsureProcessIcon(proc);
+                    lv.Items.Add(new ListViewItem(proc, iconKey));
+                }
+
+                lv.EndUpdate();
+            }
         }
 
         private void RefreshRunningProcesses()
@@ -810,35 +1110,43 @@ namespace SpotifyAutoPause
 
             if (input == "spotify" || Program.SystemProcesses.Contains(input))
             {
-                MessageBox.Show("해당 항목은 시스템 기본 보호 목록에 이미 포함되어 있습니다.", "안내", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("해당 항목은 시스템 기본 보호 목록에 포함되어 있어 추가할 수 없습니다.", "안내", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 comboRunningProcs.Text = "";
                 return;
             }
 
-            if (!Program.UserIgnoreProcesses.Contains(input))
-            {
-                Program.UserIgnoreProcesses.Add(input);
-                Program.SaveConfig();
-                RefreshIgnoreListView();
-            }
+            int idx = tabControl.SelectedIndex;
+            var targetSet = GetTargetSet(idx);
+
+            // 다른 탭에 중복 등록되어 있다면 충돌 방지를 위해 기존 탭에서 자동 이동
+            Program.UserIgnoreProcesses.Remove(input);
+            Program.ForceFocusProcesses.Remove(input);
+            Program.ForceBackgroundProcesses.Remove(input);
+
+            targetSet.Add(input);
+            Program.SaveConfig();
+            RefreshAllListViews();
             comboRunningProcs.Text = "";
         }
 
         private void OnRemoveClick(object sender, EventArgs e)
         {
-            if (listViewIgnore.SelectedItems.Count == 0) return;
-            string selected = listViewIgnore.SelectedItems[0].Text;
+            int idx = tabControl.SelectedIndex;
+            var lv = listViews[idx];
+            if (lv.SelectedItems.Count == 0) return;
 
-            Program.UserIgnoreProcesses.Remove(selected);
+            string selected = lv.SelectedItems[0].Text;
+            GetTargetSet(idx).Remove(selected);
             Program.SaveConfig();
-            RefreshIgnoreListView();
+            RefreshAllListViews();
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && iconList != null)
+            if (disposing)
             {
-                iconList.Dispose();
+                if (iconList != null) iconList.Dispose();
+                if (toolTip != null) toolTip.Dispose();
             }
             base.Dispose(disposing);
         }
