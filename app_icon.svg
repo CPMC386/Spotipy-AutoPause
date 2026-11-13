@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Spotify Green 단색 원형 배경 (음영 없음) -->
+  <circle cx="128" cy="128" r="120" fill="#1DB954" />
+
+  <!-- 스피커 본체 (플랫 블랙 라인) -->
+  <path d="M 88 104 H 64 C 57.37 104 52 109.37 52 116 V 140 C 52 146.63 57.37 152 64 152 H 88 L 128 184 V 72 L 88 104 Z" fill="none" stroke="#121212" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- 스포티파이 스타일 2중 음파 곡선 -->
+  <path d="M 154 102 C 166 116 166 140 154 154" fill="none" stroke="#121212" stroke-width="14" stroke-linecap="round" />
+  <path d="M 178 82 C 198 107 198 149 178 174" fill="none" stroke="#121212" stroke-width="14" stroke-linecap="round" />
+
+  <!-- 초록색 외곽선(Gap) + 음소거 대각선 (선과 선이 겹치는 부분을 깔끔하게 분리) -->
+  <line x1="62" y1="62" x2="194" y2="194" stroke="#1DB954" stroke-width="26" stroke-linecap="round" />
+  <line x1="62" y1="62" x2="194" y2="194" stroke="#121212" stroke-width="14" stroke-linecap="round" />
+</svg>
